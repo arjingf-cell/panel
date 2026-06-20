@@ -899,6 +899,8 @@
                 { id: 3, actor: 'Furkan Arjin', action: 'OAC başvurusu incelendi', time: '09:21', type: 'oac' }
             ]);
             const [tickets, setTickets] = React.useState([]);
+            const [ticketsLoading, setTicketsLoading] = React.useState(true);
+            const [ticketsError, setTicketsError] = React.useState('');
 
             const [artists, setArtists] = React.useState([]);
             const [artistsLoading, setArtistsLoading] = React.useState(false);
@@ -947,6 +949,9 @@
             });
             const [selectedExternalArtist, setSelectedExternalArtist] = React.useState(null);
             const [selectedAnalyticsRow, setSelectedAnalyticsRow] = React.useState(null);
+            const [selectedAnalyticsArtistKey, setSelectedAnalyticsArtistKey] = React.useState(null);
+            const [analyticsArtistListOpen, setAnalyticsArtistListOpen] = React.useState(false);
+            const [analyticsArtistSearch, setAnalyticsArtistSearch] = React.useState('');
             const [analyticsSaving, setAnalyticsSaving] = React.useState(false);
             const [releases, setReleases] = React.useState([
                 {
@@ -1096,7 +1101,7 @@
                     .on('postgres_changes', { event: '*', schema: 'public', table: 'withdrawal_requests' }, loadWithdrawalRequests)
                     .subscribe();
                 return () => supabaseClient.removeChannel(channel);
-            }, []);
+            }, [isLoggedIn]);
 
             const packageMeta = {
                 single: {
@@ -1184,6 +1189,7 @@
                     setExternalRevenues((data || []).map(row => ({
                         id: row.id,
                         artistName: row.stage_name || row.artist_email || '-',
+                        artistEmail: row.artist_email || '',
                         songName: row.song_name || '-',
                         amount: Number(row.amount) || 0,
                         asteraPercent: Number(row.astera_percent) || 0,
@@ -1207,7 +1213,7 @@
                     .on('postgres_changes', { event: '*', schema: 'public', table: 'external_artist_revenues' }, loadAnalyticsSalesFromSupabase)
                     .subscribe();
                 return () => supabaseClient.removeChannel(channel);
-            }, []);
+            }, [isLoggedIn]);
 
             const analyticsTotals = React.useMemo(() => {
                 const packageSalesTotal = packageSales.reduce((sum, item) => sum + (Number(item.price) || 0), 0);
@@ -1243,6 +1249,109 @@
                 if (analyticsFilter === 'external') return rows.filter(row => row.rowType === 'external');
                 return rows;
             }, [packageSales, externalRevenues, analyticsFilter]);
+
+            const getAnalyticsArtistKey = (email, name) => {
+                const normalizedEmail = String(email || '').trim().toLowerCase();
+                if (normalizedEmail && normalizedEmail !== '-') return `email:${normalizedEmail}`;
+                return `name:${cleanStorageName(name || 'isimsiz')}`;
+            };
+
+            const analyticsArtistSummaries = React.useMemo(() => {
+                const summaryMap = new Map();
+                const resolveSummaryKey = (email, name) => {
+                    const directKey = getAnalyticsArtistKey(email, name);
+                    if (summaryMap.has(directKey)) return directKey;
+                    const normalizedName = cleanStorageName(name || '');
+                    const validEmail = email && String(email).trim() !== '-';
+                    const existing = Array.from(summaryMap.values()).find(item =>
+                        (validEmail && item.email && item.email !== '-' && item.email.toLowerCase() === String(email).toLowerCase()) ||
+                        (normalizedName && cleanStorageName(item.artistName) === normalizedName)
+                    );
+                    return existing?.key || directKey;
+                };
+                const getOrCreate = (key, name, email) => {
+                    if (!summaryMap.has(key)) {
+                        summaryMap.set(key, {
+                            key,
+                            artistName: name || email || 'İsimsiz Sanatçı',
+                            email: email || '',
+                            totalEarned: 0,
+                            totalPaid: 0,
+                            pendingPayment: 0,
+                            rejectedPayment: 0,
+                            transactions: []
+                        });
+                    }
+                    const summary = summaryMap.get(key);
+                    if ((!summary.artistName || summary.artistName === 'İsimsiz Sanatçı') && name) summary.artistName = name;
+                    if (!summary.email && email) summary.email = email;
+                    return summary;
+                };
+
+                artists.forEach(artist => {
+                    const artistEmail = artist.email && artist.email !== '-' ? artist.email : '';
+                    const key = resolveSummaryKey(artistEmail, artist.stageName || artist.name);
+                    getOrCreate(key, artist.stageName || artist.name, artistEmail);
+                });
+
+                externalRevenues.forEach(revenue => {
+                    const key = resolveSummaryKey(revenue.artistEmail, revenue.artistName);
+                    const summary = getOrCreate(key, revenue.artistName, revenue.artistEmail);
+                    const payableAmount = Math.max((Number(revenue.amount) || 0) - (Number(revenue.asteraShare) || 0), 0);
+                    summary.totalEarned += payableAmount;
+                    summary.transactions.push({
+                        id: `revenue-${revenue.id}`,
+                        type: 'revenue',
+                        title: revenue.songName || 'Şarkı geliri',
+                        description: `${revenue.source || 'external'} · Brüt ${formatMoney(revenue.amount || 0)} · Astera ${formatMoney(revenue.asteraShare || 0)}`,
+                        amount: payableAmount,
+                        status: 'earned',
+                        date: revenue.createdAt
+                    });
+                });
+
+                withdrawalRequests.forEach(request => {
+                    const key = resolveSummaryKey(request.email, request.artist_name);
+                    const summary = getOrCreate(key, request.artist_name, request.email);
+                    const amount = Number(request.amount) || 0;
+                    if (request.status === 'paid') summary.totalPaid += amount;
+                    else if (request.status === 'rejected') summary.rejectedPayment += amount;
+                    else summary.pendingPayment += amount;
+                    summary.transactions.push({
+                        id: `withdrawal-${request.id}`,
+                        type: 'withdrawal',
+                        title: request.status === 'paid' ? 'Ödenmiş çekim' : request.status === 'rejected' ? 'Reddedilen çekim' : 'Bekleyen ödeme talebi',
+                        description: [request.bank_name, request.iban_account_holder, request.iban].filter(Boolean).join(' · ') || 'Banka bilgisi yok',
+                        amount,
+                        status: request.status || 'pending',
+                        date: request.paid_at || request.requested_at || request.created_at,
+                        payoutDate: request.payout_date || null
+                    });
+                });
+
+                return Array.from(summaryMap.values())
+                    .map(summary => ({
+                        ...summary,
+                        availableBalance: Math.max(summary.totalEarned - summary.totalPaid - summary.pendingPayment, 0),
+                        transactions: summary.transactions.sort((a, b) => new Date(b.date || 0) - new Date(a.date || 0))
+                    }))
+                    .sort((a, b) => b.totalEarned - a.totalEarned || a.artistName.localeCompare(b.artistName, 'tr'));
+            }, [artists, externalRevenues, withdrawalRequests]);
+
+            const selectedAnalyticsArtist = React.useMemo(
+                () => analyticsArtistSummaries.find(artist => artist.key === selectedAnalyticsArtistKey) || null,
+                [analyticsArtistSummaries, selectedAnalyticsArtistKey]
+            );
+
+            const filteredAnalyticsArtistSummaries = React.useMemo(() => {
+                const search = analyticsArtistSearch.trim();
+                if (search.length < 3) return analyticsArtistSummaries;
+                const normalizedSearch = cleanStorageName(search);
+                return analyticsArtistSummaries.filter(artist =>
+                    cleanStorageName(artist.artistName).includes(normalizedSearch) ||
+                    cleanStorageName(artist.email).includes(normalizedSearch)
+                );
+            }, [analyticsArtistSummaries, analyticsArtistSearch]);
 
             const addPackageSale = async () => {
                 const artistName = packageSaleForm.artistName.trim();
@@ -1685,30 +1794,12 @@
 
                 setGiftSaving(true);
                 const giftDays = Math.max(1, Number(giftForm.days) || 365);
-                const giftStartedAt = new Date();
-                const giftExpiresAt = new Date(giftStartedAt.getTime() + giftDays * 86400000).toISOString();
-                const { data, error } = await supabaseClient.rpc('gift_artist_package', {
+                const { data, error } = await supabaseClient.rpc('gift_artist_package_days', {
                     p_artist_id: artistId,
                     p_package_type: giftForm.packageType,
                     p_note: giftForm.note || null,
-                    p_months: Math.max(1, Math.ceil(giftDays / 30))
+                    p_days: giftDays
                 });
-
-                let updateError = null;
-                if (!error && giftForm.packageType !== 'single') {
-                    const updateResult = await supabaseClient
-                        .from('artists')
-                        .update({
-                            package_type: giftForm.packageType,
-                            package_started_at: giftStartedAt.toISOString(),
-                            package_expires_at: giftExpiresAt,
-                            payment_status: 'paid',
-                            panel_status: 'active',
-                            account_status: 'active'
-                        })
-                        .eq('id', artistId);
-                    updateError = updateResult.error;
-                }
                 setGiftSaving(false);
 
                 if (error) {
@@ -1716,18 +1807,14 @@
                     return;
                 }
 
-                if (updateError) {
-                    alert('Paket eklendi fakat gün sayısı sanatçı kaydına yazılamadı: ' + updateError.message);
-                    return;
-                }
-
                 const meta = getPackageMeta(giftForm.packageType);
-                const nextExpiresAt = giftForm.packageType === 'single' ? (data?.expires_at || selectedGiftArtist.packageExpiresAt) : giftExpiresAt;
+                const nextExpiresAt = data?.expires_at || selectedGiftArtist.packageExpiresAt;
+                const nextStartedAt = data?.starts_at || selectedGiftArtist.packageStartedAt || new Date().toISOString();
                 setSelectedGiftArtist(prev => prev ? {
                     ...prev,
                     packageType: giftForm.packageType,
                     package: meta.shortLabel,
-                    packageStartedAt: giftStartedAt.toISOString(),
+                    packageStartedAt: nextStartedAt,
                     packageExpiresAt: nextExpiresAt,
                     paymentStatus: 'paid',
                     accountStatus: 'active',
@@ -1744,10 +1831,18 @@
                 setArtistsLoading(true);
                 setArtistsError('');
 
-                const { data, error } = await supabaseClient
-                    .from('artists')
-                    .select('*')
-                    .order('created_at', { ascending: false });
+                const [artistResult, entitlementResult] = await Promise.all([
+                    supabaseClient
+                        .from('artists')
+                        .select('*')
+                        .order('created_at', { ascending: false }),
+                    supabaseClient
+                        .from('release_entitlements')
+                        .select('artist_id, package_type, label_plan, starts_at, expires_at, status, unlimited, created_at')
+                        .order('created_at', { ascending: false })
+                ]);
+
+                const { data, error } = artistResult;
 
                 if (error) {
                     console.error('Supabase sanatçı kayıtları alınamadı:', error);
@@ -1757,7 +1852,28 @@
                     return;
                 }
 
+                if (entitlementResult.error) {
+                    console.error('Paket hakları alınamadı:', entitlementResult.error);
+                }
+
+                const entitlementByArtistId = new Map();
+                (entitlementResult.data || []).forEach(entitlement => {
+                    const artistId = String(entitlement.artist_id || '');
+                    if (!artistId) return;
+
+                    const current = entitlementByArtistId.get(artistId);
+                    const entitlementExpiry = entitlement.expires_at ? new Date(entitlement.expires_at).getTime() : 0;
+                    const currentExpiry = current?.expires_at ? new Date(current.expires_at).getTime() : 0;
+                    const isActive = entitlement.status === 'active';
+                    const currentIsActive = current?.status === 'active';
+
+                    if (!current || (isActive && !currentIsActive) || (isActive === currentIsActive && entitlementExpiry > currentExpiry)) {
+                        entitlementByArtistId.set(artistId, entitlement);
+                    }
+                });
+
                 const mappedArtists = (data || []).map((row) => {
+                    const entitlement = entitlementByArtistId.get(String(row.id)) || null;
                     const createdDate = row.created_at ? row.created_at.split('T')[0] : new Date().toISOString().split('T')[0];
                     const accountType = row.hesap_turu || row.account_type || row.type || 'Sanatçı';
                     const labelValue = row.label_adi || row.label_name || row.label || '-';
@@ -1766,7 +1882,12 @@
                     const phoneValue = row.telefon || row.phone || row.phone_number || row.ulke_kodu || row.country_code || '-';
                     const countryCode = row.ulke_kodu || row.country_code || '-';
                     const termsApproved = Boolean(row.sartlar_onay ?? row.terms_approved ?? row.terms_accept);
-                    const packageType = row.package_type || 'new';
+                    const artistExpiryTime = row.package_expires_at ? new Date(row.package_expires_at).getTime() : 0;
+                    const entitlementExpiryTime = entitlement?.expires_at ? new Date(entitlement.expires_at).getTime() : 0;
+                    const useEntitlementDates = entitlementExpiryTime > artistExpiryTime;
+                    const packageType = (useEntitlementDates ? entitlement?.package_type : row.package_type) || row.package_type || entitlement?.package_type || 'new';
+                    const packageStartedAt = (useEntitlementDates ? entitlement?.starts_at : row.package_started_at) || row.package_started_at || entitlement?.starts_at || null;
+                    const packageExpiresAt = (useEntitlementDates ? entitlement?.expires_at : row.package_expires_at) || row.package_expires_at || entitlement?.expires_at || null;
                     const activePackage = getPackageMeta(packageType);
                     return {
                         raw: row,
@@ -1781,13 +1902,14 @@
                         releases: 0,
                         package: activePackage.shortLabel,
                         packageType,
-                        packageStartedAt: row.package_started_at || null,
-                        packageExpiresAt: row.package_expires_at || null,
+                        packageStartedAt,
+                        packageExpiresAt,
+                        packageDateSource: packageExpiresAt ? (useEntitlementDates ? 'release_entitlements' : 'artists') : null,
                         paymentStatus: row.payment_status || 'unpaid',
                         panelStatus: row.panel_status || 'pending',
                         accountStatus: row.account_status || 'pending',
-                        labelPlan: row.label_plan || null,
-                        price: packageType === 'single' ? '1 hak' : getPackageRemainingLabel({ packageType, packageExpiresAt: row.package_expires_at }),
+                        labelPlan: row.label_plan || entitlement?.label_plan || null,
+                        price: packageType === 'single' ? '1 hak' : getPackageRemainingLabel({ packageType, packageExpiresAt }),
                         source: 'Supabase',
                         accountType,
                         labelName: labelValue,
@@ -1802,6 +1924,14 @@
                 });
 
                 setArtists(mappedArtists);
+                setSelectedArtist(previous => previous
+                    ? mappedArtists.find(artist => artist.id === previous.id) || previous
+                    : previous
+                );
+                setSelectedGiftArtist(previous => previous
+                    ? mappedArtists.find(artist => artist.id === previous.id) || previous
+                    : previous
+                );
                 setArtistsLoading(false);
                 await loadArtistRevenuesFromSupabase(mappedArtists);
             };
@@ -1809,7 +1939,7 @@
             React.useEffect(() => {
                 loadArtistsFromSupabase();
                 loadReleasesFromSupabase();
-            }, []);
+            }, [isLoggedIn]);
 
             const loadAnnouncementsFromSupabase = async () => {
                 const { data, error } = await supabaseClient
@@ -2442,8 +2572,117 @@
                 return data;
             }, []);
 
-            const toggleTicketStatus = (id, newStatus) => {
-                setTickets(tickets.map(t => t.id === id ? { ...t, status: newStatus } : t));
+            const mapSupportMessage = (row) => ({
+                id: row.id,
+                from: row.sender_type === 'admin' ? 'admin' : 'user',
+                name: row.sender_name || (row.sender_type === 'admin' ? 'Destek Ekibi' : 'Kullanıcı'),
+                text: row.message || '',
+                createdAt: row.created_at || new Date().toISOString(),
+                time: row.created_at
+                    ? new Date(row.created_at).toLocaleString('tr-TR', {
+                        day: '2-digit',
+                        month: '2-digit',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    })
+                    : new Date().toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })
+            });
+
+            const mapIncomingTicket = (row) => {
+                const createdAt = row.created_at || new Date().toISOString();
+                const artistName = row.artist || 'Kullanıcı';
+                const messages = (row.support_messages || [])
+                    .map(mapSupportMessage)
+                    .sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+
+                return {
+                    id: row.id,
+                    userId: row.user_id || '',
+                    subject: row.subject || 'Konu yok',
+                    artist: artistName,
+                    date: createdAt.slice(0, 10),
+                    status: row.status || 'pending',
+                    priority: row.priority || 'normal',
+                    category: row.category || 'Genel',
+                    description: row.description || '',
+                    source: 'support_tickets',
+                    messages: messages.length ? messages : [{
+                        id: `${row.id}-initial`,
+                        from: 'user',
+                        name: artistName,
+                        text: row.description || row.subject || '',
+                        createdAt,
+                        time: new Date(createdAt).toLocaleString('tr-TR')
+                    }],
+                    notes: Array.isArray(row.internal_notes) ? row.internal_notes : []
+                };
+            };
+
+            const loadSupportTicketsFromSupabase = async () => {
+                setTicketsLoading(true);
+                setTicketsError('');
+
+                const { data, error } = await supabaseClient
+                    .from('support_tickets')
+                    .select('*, support_messages(*)')
+                    .order('created_at', { ascending: false });
+
+                if (error) {
+                    console.error('Destek talepleri alınamadı:', error);
+                    setTicketsError(error.message);
+                    setTicketsLoading(false);
+                    return;
+                }
+
+                const mappedTickets = (data || []).map(mapIncomingTicket);
+                setTickets(mappedTickets);
+                setSelectedTicket(previous => previous
+                    ? mappedTickets.find(ticket => ticket.id === previous.id) || null
+                    : previous
+                );
+                setTicketsLoading(false);
+            };
+
+            React.useEffect(() => {
+                loadSupportTicketsFromSupabase();
+
+                const supportChannel = supabaseClient
+                    .channel('admin-support-ticket-feed')
+                    .on(
+                        'postgres_changes',
+                        { event: '*', schema: 'public', table: 'support_tickets' },
+                        loadSupportTicketsFromSupabase
+                    )
+                    .on(
+                        'postgres_changes',
+                        { event: '*', schema: 'public', table: 'support_messages' },
+                        loadSupportTicketsFromSupabase
+                    )
+                    .subscribe();
+
+                const refreshTimer = window.setInterval(loadSupportTicketsFromSupabase, 30000);
+                return () => {
+                    window.clearInterval(refreshTimer);
+                    supabaseClient.removeChannel(supportChannel);
+                };
+            }, [isLoggedIn]);
+
+            const toggleTicketStatus = async (id, newStatus) => {
+                const target = tickets.find(ticket => ticket.id === id);
+                if (target?.source === 'support_tickets') {
+                    const { error } = await supabaseClient
+                        .from('support_tickets')
+                        .update({ status: newStatus, updated_at: new Date().toISOString() })
+                        .eq('id', id);
+
+                    if (error) {
+                        console.error('Ticket durumu güncellenemedi:', error);
+                        setTicketsError(error.message);
+                        return;
+                    }
+                }
+
+                setTickets(prev => prev.map(t => t.id === id ? { ...t, status: newStatus } : t));
                 setSelectedTicket(prev => prev && prev.id === id ? { ...prev, status: newStatus } : prev);
                 addActivity(`Ticket #${id} durumu ${newStatus} yapildi`, 'support');
             };
@@ -2954,18 +3193,54 @@
                 setOacRejectionText('');
             };
 
-            const sendTicketReply = () => {
+            const sendTicketReply = async () => {
                 if (!selectedTicket || !ticketReply.trim()) return;
+                const replyText = ticketReply.trim();
+                const createdAt = new Date().toISOString();
                 const message = {
+                    id: `local-${Date.now()}`,
                     from: 'admin',
-                    name: 'Destek Ekibi',
-                    text: ticketReply.trim(),
-                    time: `Simdi, ${new Date().toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' })}`
+                    name: currentAdminName || 'Destek Ekibi',
+                    text: replyText,
+                    createdAt,
+                    time: new Date(createdAt).toLocaleString('tr-TR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })
                 };
+
+                if (selectedTicket.source === 'support_tickets') {
+                    const { error: messageError } = await supabaseClient
+                        .from('support_messages')
+                        .insert([{
+                            ticket_id: selectedTicket.id,
+                            sender_type: 'admin',
+                            sender_name: currentAdminName || 'Destek Ekibi',
+                            message: replyText
+                        }]);
+
+                    if (messageError) {
+                        console.error('Ticket yanıtı gönderilemedi:', messageError);
+                        setTicketsError(messageError.message);
+                        return;
+                    }
+
+                    const { error: ticketError } = await supabaseClient
+                        .from('support_tickets')
+                        .update({
+                            status: selectedTicket.status === 'closed' ? 'open' : selectedTicket.status,
+                            updated_at: createdAt
+                        })
+                        .eq('id', selectedTicket.id);
+
+                    if (ticketError) console.error('Ticket güncellenemedi:', ticketError);
+                }
+
                 const baseMessages = selectedTicket.messages || getTicketProfile(selectedTicket).messages;
-                const updatedTicket = { ...selectedTicket, messages: [...baseMessages, message] };
+                const updatedTicket = {
+                    ...selectedTicket,
+                    status: selectedTicket.status === 'closed' ? 'open' : selectedTicket.status,
+                    messages: [...baseMessages, message]
+                };
                 setSelectedTicket(updatedTicket);
-                setTickets(tickets.map(t => t.id === selectedTicket.id ? updatedTicket : t));
+                setTickets(prev => prev.map(t => t.id === selectedTicket.id ? updatedTicket : t));
                 addActivity(`Ticket #${selectedTicket.id} yanitlandi`, 'support');
                 setTicketReply('');
             };
@@ -4803,7 +5078,7 @@
                                                                         <div>
                                                                             <div className="font-bold text-sm text-zinc-100 group-hover:text-white">{artist.name}</div>
                                                                             <div className="text-[11px] text-zinc-500 font-medium">{artist.id}</div>
-                                                                            <div className="text-[10px] text-amber-400 font-bold mt-1">{artist.packageType === 'single' ? 'Single hakkı' : `${getPackageRemainingDays(artist) ?? 0} gün kaldı`}</div>
+                                                                            <div className="text-[10px] text-amber-400 font-bold mt-1">{artist.packageType === 'single' ? 'Single hakkı' : getPackageRemainingLabel(artist)}</div>
                                                                         </div>
                                                                     </div>
                                                                 </td>
@@ -4836,7 +5111,7 @@
                                             {selectedGiftArtist && selectedGiftArtist.packageType !== 'single' && (
                                                 <div className="mt-3 inline-flex items-center gap-2 rounded-xl border border-amber-500/20 bg-amber-500/10 px-3 py-2 text-[11px] font-black text-amber-300">
                                                     <i className="fas fa-hourglass-half"></i>
-                                                    {formatDateTime(selectedGiftArtist.packageExpiresAt)} tarihine kadar {getPackageRemainingDays(selectedGiftArtist) ?? 0} gün kaldı
+                                                    {formatDateTime(selectedGiftArtist.packageExpiresAt)} tarihine kadar {getPackageRemainingLabel(selectedGiftArtist)}
                                                 </div>
                                             )}
                                         </div>
@@ -4858,7 +5133,7 @@
                                                         ['Hesap Türü', selectedGiftArtist.accountType || '-'],
                                                         ['Label', selectedGiftArtist.labelName || '-'],
                                                         ['Paket Bitişi', selectedGiftArtist.packageType === 'single' ? 'Süre yok' : formatDateTime(selectedGiftArtist.packageExpiresAt)],
-                                                        ['Kalan Süre', selectedGiftArtist.packageType === 'single' ? 'Single yayın hakkı' : `${getPackageRemainingDays(selectedGiftArtist) ?? 0} gün kaldı`]
+                                                        ['Kalan Süre', selectedGiftArtist.packageType === 'single' ? 'Single yayın hakkı' : getPackageRemainingLabel(selectedGiftArtist)]
                                                     ].map(([label, value]) => (
                                                         <div key={label} className="bg-black/30 border border-zinc-800 rounded-2xl p-4">
                                                             <div className="text-[10px] font-black uppercase tracking-widest text-zinc-600">{label}</div>
@@ -4874,7 +5149,7 @@
                                                             <div className="text-lg font-black text-white mt-2">{getPackageMeta(selectedGiftArtist.packageType).label}</div>
                                                             <div className="text-xs text-zinc-500 mt-1">Başlangıç: {formatDateTime(selectedGiftArtist.packageStartedAt)} · Bitiş: {formatDateTime(selectedGiftArtist.packageExpiresAt)}</div>
                                                             {selectedGiftArtist.packageType !== 'single' && (
-                                                                <div className="text-xs text-amber-300 font-black mt-2">{getPackageRemainingDays(selectedGiftArtist) ?? 0} gün kullanım süresi kaldı</div>
+                                                                <div className="text-xs text-amber-300 font-black mt-2">{getPackageRemainingLabel(selectedGiftArtist)}</div>
                                                             )}
                                                         </div>
                                                         <span className={`shrink-0 px-3 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest border ${getPackageMeta(selectedGiftArtist.packageType).badge}`}>
@@ -4928,7 +5203,7 @@
                                                         <div className="rounded-2xl border border-amber-500/20 bg-amber-500/10 p-4">
                                                             <div className="text-[10px] font-black uppercase tracking-widest text-amber-400">Mevcut Kalan Süre</div>
                                                             <div className="text-sm font-black text-white mt-2">
-                                                                {getPackageRemainingDays(selectedGiftArtist) ?? 0} gün kaldı
+                                                                {getPackageRemainingLabel(selectedGiftArtist)}
                                                             </div>
                                                             <div className="text-xs text-zinc-500 mt-1">
                                                                 Bitiş tarihi: {formatDateTime(selectedGiftArtist.packageExpiresAt)}
@@ -5006,6 +5281,78 @@
                                     <DonutChart percent={100} label="Tüm Gelirler" value={formatMoney(analyticsTotals.allRevenue)} color="#8b5cf6" />
                                     <DonutChart percent={analyticsTotals.externalRevenueTotal ? Math.round((analyticsTotals.payable / analyticsTotals.externalRevenueTotal) * 100) : 0} label="Ödenecek Tutar" value={formatMoney(analyticsTotals.payable)} color="#3b82f6" />
                                     <DonutChart percent={100} label="Net Kar" value={formatMoney(analyticsTotals.netProfit)} color="#10b981" />
+                                </div>
+
+                                <div className="mt-10 bg-zinc-900/40 border border-zinc-800 rounded-3xl overflow-hidden shadow-2xl">
+                                    <div className="p-6 border-b border-zinc-800 flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+                                        <div>
+                                            <h3 className="text-lg font-black text-white">Sanatçı Bakiyeleri</h3>
+                                            <p className="text-xs text-zinc-500 mt-1">Sanatçıya tıklayarak tüm gelir ve ödeme geçmişini görüntüleyin.</p>
+                                        </div>
+                                        <div className="flex flex-wrap items-center gap-3">
+                                            <div className="relative min-w-[240px]">
+                                                <i className="fas fa-search absolute left-3.5 top-1/2 -translate-y-1/2 text-zinc-600 text-xs"></i>
+                                                <input
+                                                    type="search"
+                                                    value={analyticsArtistSearch}
+                                                    onChange={(event) => {
+                                                        const value = event.target.value;
+                                                        setAnalyticsArtistSearch(value);
+                                                        if (value.trim().length >= 3) setAnalyticsArtistListOpen(true);
+                                                    }}
+                                                    placeholder="En az 3 karakterle ara..."
+                                                    className="w-full bg-zinc-950 border border-zinc-800 rounded-xl py-2.5 pl-10 pr-4 text-xs text-zinc-200 outline-none focus:border-purple-500/60 placeholder:text-zinc-700"
+                                                />
+                                            </div>
+                                            <div className="text-[10px] font-black uppercase tracking-widest text-zinc-600">{filteredAnalyticsArtistSummaries.length} / {analyticsArtistSummaries.length} sanatçı</div>
+                                            <button
+                                                type="button"
+                                                onClick={() => setAnalyticsArtistListOpen(open => !open)}
+                                                className="px-4 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white text-[10px] font-black uppercase tracking-widest transition-all flex items-center gap-2"
+                                            >
+                                                <i className={`fas ${analyticsArtistListOpen ? 'fa-chevron-up' : 'fa-chevron-down'}`}></i>
+                                                {analyticsArtistListOpen ? 'Listeyi Kapat' : 'Listeyi Aç'}
+                                            </button>
+                                        </div>
+                                    </div>
+                                    {analyticsArtistListOpen && <div className="overflow-x-auto max-h-[520px] overflow-y-auto chat-scroll">
+                                        <table className="w-full text-left">
+                                            <thead className="sticky top-0 z-10 bg-zinc-950 text-[10px] uppercase tracking-widest text-zinc-500">
+                                                <tr>
+                                                    <th className="px-6 py-4">Sanatçı</th>
+                                                    <th className="px-6 py-4 text-right">Toplam Bakiye</th>
+                                                    <th className="px-6 py-4 text-right">Toplam Ödenen</th>
+                                                    <th className="px-6 py-4 text-right">Ödenmesi Beklenen</th>
+                                                    <th className="px-6 py-4 text-right">Kullanılabilir Bakiye</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-zinc-800/60">
+                                                {filteredAnalyticsArtistSummaries.map(artist => (
+                                                    <tr
+                                                        key={artist.key}
+                                                        onClick={() => setSelectedAnalyticsArtistKey(artist.key)}
+                                                        className="cursor-pointer hover:bg-purple-500/5 transition-all"
+                                                    >
+                                                        <td className="px-6 py-5">
+                                                            <div className="text-sm font-black text-white">{artist.artistName}</div>
+                                                            <div className="text-[10px] text-zinc-600 mt-1">{artist.email || 'E-posta yok'} · {artist.transactions.length} hareket</div>
+                                                        </td>
+                                                        <td className="px-6 py-5 text-right text-sm font-black text-emerald-300">{formatMoney(artist.totalEarned)}</td>
+                                                        <td className="px-6 py-5 text-right text-sm font-black text-blue-300">{formatMoney(artist.totalPaid)}</td>
+                                                        <td className="px-6 py-5 text-right text-sm font-black text-amber-300">{formatMoney(artist.pendingPayment)}</td>
+                                                        <td className="px-6 py-5 text-right text-sm font-black text-purple-300">{formatMoney(artist.availableBalance)}</td>
+                                                    </tr>
+                                                ))}
+                                                {filteredAnalyticsArtistSummaries.length === 0 && (
+                                                    <tr>
+                                                        <td colSpan="5" className="px-6 py-12 text-center text-zinc-600">
+                                                            {analyticsArtistSearch.trim().length >= 3 ? 'Aramayla eşleşen sanatçı bulunamadı.' : 'Henüz sanatçı bulunmuyor.'}
+                                                        </td>
+                                                    </tr>
+                                                )}
+                                            </tbody>
+                                        </table>
+                                    </div>}
                                 </div>
 
                                 <div className="mt-10 grid grid-cols-1 xl:grid-cols-[minmax(0,1.25fr)_420px] gap-6">
@@ -5630,7 +5977,11 @@
                                                 {currentTickets.length === 0 && (
                                                     <tr>
                                                         <td colSpan="5" className="px-8 py-12 text-center text-sm text-zinc-500">
-                                                            Supabase'den gelen destek talebi bulunmuyor.
+                                                            {ticketsLoading
+                                                                ? 'Destek talepleri yükleniyor...'
+                                                                : ticketsError
+                                                                    ? `Destek talepleri alınamadı: ${ticketsError}`
+                                                                    : "Supabase'den gelen destek talebi bulunmuyor."}
                                                         </td>
                                                     </tr>
                                                 )}
@@ -6817,6 +7168,75 @@
                                         >
                                             Sanatçıyı Kaydet
                                         </button>
+                                    </div>
+                                </div>
+                            </div>
+                        )}
+                        {selectedAnalyticsArtist && (
+                            <div className="fixed inset-0 z-[123] flex items-center justify-center p-4 bg-black/85 backdrop-blur-sm">
+                                <div className="w-full max-w-5xl max-h-[90vh] bg-zinc-900 border border-purple-500/30 rounded-3xl shadow-2xl shadow-purple-500/10 overflow-hidden flex flex-col">
+                                    <div className="px-7 py-5 border-b border-zinc-800 flex items-center justify-between gap-4">
+                                        <div>
+                                            <div className="text-[10px] font-black uppercase tracking-[0.25em] text-purple-300 mb-2">Sanatçı Finans Detayı</div>
+                                            <h3 className="text-2xl font-black text-white">{selectedAnalyticsArtist.artistName}</h3>
+                                            <p className="text-xs text-zinc-500 mt-1">{selectedAnalyticsArtist.email || 'E-posta bilgisi yok'}</p>
+                                        </div>
+                                        <button onClick={() => setSelectedAnalyticsArtistKey(null)} className="w-10 h-10 rounded-xl bg-zinc-950 border border-zinc-800 text-zinc-500 hover:text-white transition">
+                                            <i className="fas fa-times"></i>
+                                        </button>
+                                    </div>
+
+                                    <div className="p-6 grid grid-cols-2 lg:grid-cols-4 gap-4 border-b border-zinc-800">
+                                        {[
+                                            ['Toplam Bakiye', selectedAnalyticsArtist.totalEarned, 'text-emerald-300'],
+                                            ['Toplam Ödenen', selectedAnalyticsArtist.totalPaid, 'text-blue-300'],
+                                            ['Ödenmesi Beklenen', selectedAnalyticsArtist.pendingPayment, 'text-amber-300'],
+                                            ['Kullanılabilir Bakiye', selectedAnalyticsArtist.availableBalance, 'text-purple-300']
+                                        ].map(([label, amount, color]) => (
+                                            <div key={label} className="bg-black/35 border border-zinc-800 rounded-2xl p-5">
+                                                <div className="text-[9px] font-black uppercase tracking-widest text-zinc-600">{label}</div>
+                                                <div className={`text-xl font-black mt-2 ${color}`}>{formatMoney(amount)}</div>
+                                            </div>
+                                        ))}
+                                    </div>
+
+                                    <div className="overflow-y-auto chat-scroll">
+                                        <table className="w-full text-left">
+                                            <thead className="sticky top-0 bg-zinc-950 text-[10px] uppercase tracking-widest text-zinc-500 z-10">
+                                                <tr>
+                                                    <th className="px-6 py-4">Tarih</th>
+                                                    <th className="px-6 py-4">İşlem</th>
+                                                    <th className="px-6 py-4">Detay</th>
+                                                    <th className="px-6 py-4">Durum</th>
+                                                    <th className="px-6 py-4 text-right">Tutar</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody className="divide-y divide-zinc-800/60">
+                                                {selectedAnalyticsArtist.transactions.map(transaction => {
+                                                    const isRevenue = transaction.type === 'revenue';
+                                                    const statusMeta = transaction.status === 'paid'
+                                                        ? ['Ödendi', 'bg-blue-500/10 text-blue-300 border-blue-500/20']
+                                                        : transaction.status === 'rejected'
+                                                            ? ['Reddedildi', 'bg-red-500/10 text-red-300 border-red-500/20']
+                                                            : isRevenue
+                                                                ? ['Kazanç', 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20']
+                                                                : ['Bekliyor', 'bg-amber-500/10 text-amber-300 border-amber-500/20'];
+                                                    return (
+                                                        <tr key={transaction.id} className="hover:bg-white/[0.02]">
+                                                            <td className="px-6 py-4 text-xs text-zinc-500 whitespace-nowrap">{formatDateTime(transaction.date)}</td>
+                                                            <td className="px-6 py-4 text-sm font-black text-white">{transaction.title}</td>
+                                                            <td className="px-6 py-4 text-xs text-zinc-500 max-w-sm">{transaction.description}</td>
+                                                            <td className="px-6 py-4">
+                                                                <span className={`inline-flex px-2.5 py-1 rounded-lg border text-[9px] font-black uppercase ${statusMeta[1]}`}>{statusMeta[0]}</span>
+                                                            </td>
+                                                            <td className={`px-6 py-4 text-right text-sm font-black ${isRevenue ? 'text-emerald-300' : 'text-blue-300'}`}>
+                                                                {isRevenue ? '+' : '-'}{formatMoney(transaction.amount)}
+                                                            </td>
+                                                        </tr>
+                                                    );
+                                                })}
+                                            </tbody>
+                                        </table>
                                     </div>
                                 </div>
                             </div>
